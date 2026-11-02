@@ -508,7 +508,10 @@ export interface FactorySettings {
 export const FACTORY_SETTINGS: FactorySettings = {
 	version: CURRENT_SETTINGS_VERSION,
 	general: { autoUpdate: true },
-	dictation: { language: "en" },
+	// FORK: whisper-svc FORCES a language (no auto-detect), so a wrong factory
+	// default would garble a first run. Dutch is the language this install is
+	// used in; the picker still offers every supported language.
+	dictation: { language: "nl" },
 	appearance: {
 		mode: "dark",
 		background: null, // the dark default (#141414) lives in the mode's derivation curve

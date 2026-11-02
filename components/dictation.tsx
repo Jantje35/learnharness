@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2Icon, MicIcon } from "lucide-react";
 import { useSettingsDialog } from "@/components/settings/settings-dialog";
 import { Hint } from "@/components/ui/hint";
-import { deepgramListenUrl, type DictationLanguage } from "@/src/core";
+import { bytesToBase64, deepgramListenUrl, pcmFramesToWav, whisperLanguage, type DictationLanguage } from "@/src/core";
 import { useDictationLanguage } from "@/components/dictation-preference";
 import { setDictationActive } from "@/components/dictation-state";
 export { isDictationActive } from "@/components/dictation-state";
@@ -84,6 +84,37 @@ export { isDictationActive } from "@/components/dictation-state";
  *   - The honest floor stays: getUserMedia can't be pre-warmed (the mic
  *     indicator would stay lit) — hence the owner's optimistic meter.
  */
+
+/*
+ * FORK: local whisper dictation (NEXT_PUBLIC_LH_STT_ENGINE=whisper).
+ *
+ * The capture graph, the meter, the target registry, the deferred buffer and
+ * the finish()/cancel() semantics are untouched — only the TRANSPORT differs:
+ *
+ *   deepgram (upstream default)  frames stream to api.deepgram.com over a
+ *                                WebSocket; finals arrive live and buffer
+ *                                until teardown.
+ *   whisper  (this fork)         frames accumulate in memory; at stop the
+ *                                utterance is encoded to 16 kHz WAV and POSTed
+ *                                to /api/stt/transcribe, which forwards it to
+ *                                the homelab whisper-svc. One transcript per
+ *                                run, buffered identically, so the flush
+ *                                contract above still holds.
+ *
+ * Why a switch and not a rewrite: upstream moves fast (a cloud STT path with
+ * its own tests), the local path is additive, and rebasing a small diff stays
+ * cheap. Unset/any other value → the upstream Deepgram behaviour.
+ */
+
+/** Selected dictation transport. Inlined at build time (NEXT_PUBLIC_). */
+export const STT_ENGINE: "deepgram" | "whisper" =
+	process.env.NEXT_PUBLIC_LH_STT_ENGINE === "whisper" ? "whisper" : "deepgram";
+
+/** Local engine: captured frames for the current run (cleared at teardown).
+ *  A 10-minute cap keeps a forgotten session from eating memory; the oldest
+ *  frames drop first, mirroring the pre-open queue policy above. */
+const LOCAL_FRAME_CAP = Math.ceil((16000 * 2 * 600) / 4096); // ≈10 min of 4096-byte frames
+
 
 /*
  * Deepgram streaming params (the owner's live-tuned dictate config): nova-3,
@@ -311,6 +342,11 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 	 *  order on open; capped at 256 frames (≈32s) with the oldest dropped;
 	 *  cleared at teardown so a dead run's audio can't leak into the next. */
 	const pendingRef = useRef<ArrayBuffer[]>([]);
+	/** Local engine: the current run's captured frames (whisper transport). */
+	const pcmRef = useRef<ArrayBuffer[]>([]);
+	/** Local engine: the language this run was started with — stop() may land
+	 *  after a settings refresh, and the transcript belongs to the old one. */
+	const langRef = useRef<DictationLanguage | null>(null);
 	const genRef = useRef(0); // stale-handler guard (dictate pattern)
 	const safetyRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const reconnectsRef = useRef(0);
@@ -341,6 +377,7 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			safetyRef.current = null;
 		}
 		pendingRef.current = [];
+		pcmRef.current = []; // local engine: a dead run's audio never leaks forward
 		for (const track of streamRef.current?.getTracks() ?? []) track.stop();
 		streamRef.current = null;
 		sourceRef.current?.disconnect();
@@ -361,8 +398,8 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		// target field with the dictated tail already in it.
 		for (const w of waitersRef.current.splice(0)) w();
 		// Pre-mint for the next run (mitigation D) — best-effort; a keyless
-		// page just doesn't warm.
-		if (warmNext) warmTokens.refresh();
+		// page just doesn't warm. Local engine has no token to warm.
+		if (warmNext && STT_ENGINE === "deepgram") warmTokens.refresh();
 	}, []);
 
 	/** Open the Deepgram socket and wire its messages. `gen` guards staleness. */
@@ -448,15 +485,16 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			return;
 		}
 		if (gen !== genRef.current) return;
+		langRef.current = language; // the run's language, frozen for stop()
 
 		// Mitigation D: the warm token (pre-minted at mount / after the last
 		// run) resolves ~instantly; a cold/keyless mint surfaces below. The
 		// mic is the long pole (macOS HAL + APM init) and gates everything —
 		// the token runs concurrently with it. 127.0.0.1 is a secure
 		// context, so getUserMedia works without TLS; macOS TCC prompts on
-		// first use.
-		const tokenPromise = warmTokens.mint();
-		tokenPromise.catch(() => {}); // surfaced below; no unhandled rejection
+		// first use. The local engine has no token at all.
+		const tokenPromise = STT_ENGINE === "deepgram" ? warmTokens.mint() : null;
+		tokenPromise?.catch(() => {}); // surfaced below; no unhandled rejection
 		const micPromise = navigator.mediaDevices.getUserMedia({
 			audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
 		});
@@ -483,6 +521,13 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 				if (msg.type === "level") {
 					levelRef.current = msg.rms ?? 0; // never reset to zero (dictate pattern)
 				} else if (msg.type === "audio") {
+					// Local engine: keep the utterance in memory; stop() encodes
+					// it to WAV and uploads it. No socket, so nothing queues.
+					if (STT_ENGINE === "whisper") {
+						pcmRef.current.push(msg.buffer!);
+						if (pcmRef.current.length > LOCAL_FRAME_CAP) pcmRef.current.shift();
+						return;
+					}
 					const ws = wsRef.current;
 					if (ws && ws.readyState === WebSocket.OPEN) ws.send(msg.buffer!);
 					// Mitigation A: not OPEN yet (handshake or reconnect gap) —
@@ -499,6 +544,13 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 			// Pull the graph with silence out (the worklet writes no output) —
 			// an unconnected worklet node is never clocked.
 			worklet.connect(ctx.destination);
+
+			// Local engine: capture IS the connection — nothing to handshake,
+			// so the meter's own "recording" state starts here.
+			if (STT_ENGINE === "whisper") {
+				setPhase("recording");
+				return;
+			}
 		} catch (e) {
 			if (gen !== genRef.current) return;
 			const msg =
@@ -514,7 +566,7 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		if (gen !== genRef.current) return;
 		let token: string;
 		try {
-			token = await tokenPromise;
+			token = await (tokenPromise ?? warmTokens.mint());
 		} catch (e) {
 			if (gen !== genRef.current) return;
 			setError(e instanceof Error ? e.message : "token unavailable");
@@ -526,6 +578,49 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		// overlapping any remaining token wait — mic-gated, never before it.
 		openSocket(gen, token, language);
 	}, [openSocket, cleanup, getLanguage]);
+
+	/** Local engine: utterance → WAV → /api/stt/transcribe → deferred buffer.
+	 *  Every path ends in cleanup(), so finish()'s waiters resolve exactly as
+	 *  they do on the cloud path (a submit that awaits dictation still reads
+	 *  the dictated tail in the field afterwards). */
+	const transcribeLocal = useCallback(
+		async (gen: number) => {
+			const frames = pcmRef.current;
+			pcmRef.current = [];
+			// A tap that never produced a single frame (stopped while the graph
+			// was still starting) is a no-op, not an error.
+			if (frames.length === 0) {
+				if (gen === genRef.current) cleanup();
+				return;
+			}
+			const wav = pcmFramesToWav(frames);
+			if (wav.length === 0) {
+				if (gen === genRef.current) {
+					setError("No speech detected");
+					cleanup();
+				}
+				return;
+			}
+			const language = langRef.current ? whisperLanguage(langRef.current) : null;
+			const audioBase64 = bytesToBase64(wav);
+			try {
+				const res = await fetch("/api/stt/transcribe", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(language ? { audio_base64: audioBase64, language } : { audio_base64: audioBase64 }),
+				});
+				const body = (await res.json()) as { text?: string; message?: string };
+				if (gen !== genRef.current) return;
+				if (!res.ok) throw new Error(body.message ?? `transcribe route ${res.status}`);
+				if (body.text) bufferRef.current.push(body.text);
+			} catch (e) {
+				if (gen !== genRef.current) return;
+				setError(e instanceof Error ? e.message : "Transcription failed");
+			}
+			if (gen === genRef.current) cleanup();
+		},
+		[cleanup],
+	);
 
 	const stop = useCallback(() => {
 		const gen = genRef.current;
@@ -540,6 +635,14 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		sourceRef.current = null;
 		workletRef.current?.disconnect();
 		workletRef.current = null;
+
+		// Local engine: no socket to close — the captured utterance goes out
+		// in one request. "stopping" means the same thing it does upstream:
+		// the transcript is in flight and the flush has not happened yet.
+		if (STT_ENGINE === "whisper") {
+			void transcribeLocal(gen);
+			return;
+		}
 
 		const ws = wsRef.current;
 		if (ws && ws.readyState === WebSocket.OPEN) {
@@ -557,7 +660,7 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 		} else {
 			cleanup();
 		}
-	}, [phase, cleanup]);
+	}, [phase, cleanup, transcribeLocal]);
 
 	const cancel = useCallback(() => {
 		if (phase === "idle") return;
@@ -600,7 +703,8 @@ export function useDictation({ append }: { append: (text: string) => void }): Di
 	// page owns ONE hook instance, and only the mounted page's listener is
 	// attached.
 	useEffect(() => {
-		warmTokens.refresh(); // pre-mint at mount (mitigation D) — silent if keyless
+		// Pre-mint at mount (mitigation D) — silent if keyless, skipped locally.
+		if (STT_ENGINE === "deepgram") warmTokens.refresh();
 		return () => {
 			// Navigation cancels capture: invalidate every pending await before
 			// releasing resources, and never append into a different page's input.

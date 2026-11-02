@@ -88,3 +88,16 @@ export function deepgramListenUrl(language: DictationLanguage): string {
 		"&smart_format=true&punctuate=true&endpointing=300" +
 		`&language=${encodeURIComponent(language)}`;
 }
+
+/**
+ * Fork (local whisper dictation): the same preference, expressed for
+ * whisper-svc, which speaks ISO-639-1 and FORCES a language (no auto-detect).
+ *
+ * - locales collapse to their base language ("pt-BR" → "pt", "zh-Hant" → "zh")
+ * - "multi" returns null: the service default applies (nl — see
+ *   app/api/stt/transcribe/route.ts)
+ */
+export function whisperLanguage(language: DictationLanguage): string | null {
+	if (language === "multi") return null;
+	return language.split("-")[0]!.toLowerCase();
+}

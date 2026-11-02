@@ -34,9 +34,9 @@ describe("Nova-3 dictation language contract", () => {
 		}
 	});
 
-	it("old records default to English and explicit preferences resolve without a migration", () => {
-		assert.equal(resolveSettings(null).dictation.language, "en");
-		assert.equal(resolveSettings({ version: 1 }).dictation.language, "en");
+	it("old records fall back to the fork default and explicit preferences resolve without a migration", () => {
+		assert.equal(resolveSettings(null).dictation.language, "nl");
+		assert.equal(resolveSettings({ version: 1 }).dictation.language, "nl");
 		for (const language of ["pl", "multi", "en-GB"] as const) {
 			const record = sanitizeUserSettings({ version: 1, dictation: { language } });
 			assert.equal(record?.version, 1);
@@ -52,7 +52,7 @@ describe("Nova-3 dictation language contract", () => {
 		}
 		for (const dictation of [null, [], "pl", { language: "xx" }, { language: 3 }]) {
 			const record = sanitizeUserSettings({ version: 1, dictation, general: { autoUpdate: false } });
-			assert.equal(resolveSettings(record).dictation.language, "en");
+			assert.equal(resolveSettings(record).dictation.language, "nl");
 			assert.equal(record?.general?.autoUpdate, false);
 		}
 	});

@@ -66,6 +66,9 @@ export * from "./fuzzy.ts";
 // view. Browser-safe — the Wave-4 panel imports these directly.
 export * from "./settings.ts";
 export * from "./dictation.ts";
+// wav.ts (fork, local dictation): frames → 16 kHz WAV for whisper-svc. Pure
+// and browser-safe (the dictation hook encodes in the renderer).
+export * from "./wav.ts";
 // graph-deletion.ts (wave 6): the whole module is PURE but storage-port
 // driven — the deletion RUNS server-side only. The shell needs exactly one
 // two type-only things from it: the ChatDeleteMode union (the delete

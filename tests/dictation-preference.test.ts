@@ -11,7 +11,7 @@ test("all readers immediately receive the confirmed write without another GET", 
 		reads++;
 		return failReads ? Response.json({}, { status: 500 }) : Response.json({ settings: null });
 	}, () => { notifications++; });
-	assert.equal(await store.load(), "en");
+	assert.equal(await store.load(), "nl"); // fork factory default (whisper forces a language)
 	const observed: string[] = [];
 	const off = store.subscribe(() => { observed.push(`${store.getSnapshot().language}:${store.getSnapshot().saving}`); });
 	failReads = true;

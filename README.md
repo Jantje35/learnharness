@@ -22,6 +22,15 @@ Instead of just giving you an explanation, it uses your answers and thinking to 
 
 ![LearnHarness teaching session](docs/assets/teaching-session.png)
 
+## This fork: local dictation
+
+Cloud dictation is replaced by the homelab whisper-svc.
+`NEXT_PUBLIC_LH_STT_ENGINE=whisper` records the utterance and POSTs it to
+`/api/stt/transcribe` instead of streaming audio to Deepgram; no provider key
+is involved and audio stays on the LAN. Setup, behaviour and tests:
+[docs/local-stt.md](docs/local-stt.md). With the switch unset, the upstream
+Deepgram path is untouched.
+
 ## How it works
 
 1. **Measure.** Before teaching, the agent finds where your understanding ends on each part the lesson depends on. Your answers, confidence, and thinking show it where to start.
